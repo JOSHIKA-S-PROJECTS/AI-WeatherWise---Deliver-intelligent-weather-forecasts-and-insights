@@ -1,638 +1,1043 @@
 'use strict';
 
-var test = require('tape');
-var inspect = require('object-inspect');
-var SaferBuffer = require('safer-buffer').Buffer;
-var forEach = require('for-each');
-var v = require('es-value-fixtures');
+/*!
+ * Module dependencies.
+ */
 
-var utils = require('../lib/utils');
+const UUID = require('bson').UUID;
+const ms = require('ms');
+const mpath = require('mpath');
+const ObjectId = require('./types/objectid');
+const PopulateOptions = require('./options/populateOptions');
+const clone = require('./helpers/clone');
+const immediate = require('./helpers/immediate');
+const isObject = require('./helpers/isObject');
+const isMongooseArray = require('./types/array/isMongooseArray');
+const isMongooseDocumentArray = require('./types/documentArray/isMongooseDocumentArray');
+const isBsonType = require('./helpers/isBsonType');
+const isPOJO = require('./helpers/isPOJO');
+const getFunctionName = require('./helpers/getFunctionName');
+const isMongooseObject = require('./helpers/isMongooseObject');
+const promiseOrCallback = require('./helpers/promiseOrCallback');
+const schemaMerge = require('./helpers/schema/merge');
+const specialProperties = require('./helpers/specialProperties');
+const { trustedSymbol } = require('./helpers/query/trusted');
 
-test('merge()', function (t) {
-    t.deepEqual(utils.merge(null, true), [null, true], 'merges true into null');
+let Document;
 
-    t.deepEqual(utils.merge(null, [42]), [null, 42], 'merges null into an array');
+exports.specialProperties = specialProperties;
 
-    t.deepEqual(utils.merge({ a: 'b' }, { a: 'c' }), { a: ['b', 'c'] }, 'merges two objects with the same key');
+exports.isMongooseArray = isMongooseArray.isMongooseArray;
+exports.isMongooseDocumentArray = isMongooseDocumentArray.isMongooseDocumentArray;
+exports.registerMongooseArray = isMongooseArray.registerMongooseArray;
+exports.registerMongooseDocumentArray = isMongooseDocumentArray.registerMongooseDocumentArray;
 
-    var oneMerged = utils.merge({ foo: 'bar' }, { foo: { first: '123' } });
-    t.deepEqual(oneMerged, { foo: ['bar', { first: '123' }] }, 'merges a standalone and an object into an array');
+const oneSpaceRE = /\s/;
+const manySpaceRE = /\s+/;
 
-    var twoMerged = utils.merge({ foo: ['bar', { first: '123' }] }, { foo: { second: '456' } });
-    t.deepEqual(twoMerged, { foo: { 0: 'bar', 1: { first: '123' }, second: '456' } }, 'merges a standalone and two objects into an array');
+/**
+ * Produces a collection name from model `name`. By default, just returns
+ * the model name
+ *
+ * @param {String} name a model name
+ * @param {Function} pluralize function that pluralizes the collection name
+ * @return {String} a collection name
+ * @api private
+ */
 
-    var sandwiched = utils.merge({ foo: ['bar', { first: '123', second: '456' }] }, { foo: 'baz' });
-    t.deepEqual(sandwiched, { foo: ['bar', { first: '123', second: '456' }, 'baz'] }, 'merges an object sandwiched by two standalones into an array');
+exports.toCollectionName = function(name, pluralize) {
+  if (name === 'system.profile') {
+    return name;
+  }
+  if (name === 'system.indexes') {
+    return name;
+  }
+  if (typeof pluralize === 'function') {
+    if (typeof name !== 'string') {
+      throw new TypeError('Collection name must be a string');
+    }
+    if (name.length === 0) {
+      throw new TypeError('Collection name cannot be empty');
+    }
+    return pluralize(name);
+  }
+  return name;
+};
 
-    var nestedArrays = utils.merge({ foo: ['baz'] }, { foo: ['bar', 'xyzzy'] });
-    t.deepEqual(nestedArrays, { foo: ['baz', 'bar', 'xyzzy'] });
+/**
+ * Determines if `a` and `b` are deep equal.
+ *
+ * Modified from node/lib/assert.js
+ *
+ * @param {any} a a value to compare to `b`
+ * @param {any} b a value to compare to `a`
+ * @return {Boolean}
+ * @api private
+ */
 
-    var noOptionsNonObjectSource = utils.merge({ foo: 'baz' }, 'bar');
-    t.deepEqual(noOptionsNonObjectSource, { foo: 'baz', bar: true });
+exports.deepEqual = function deepEqual(a, b) {
+  if (a === b) {
+    return true;
+  }
 
-    var func = function f() {};
-    func();
-    t.deepEqual(
-        utils.merge(func, { foo: 'bar' }),
-        [func, { foo: 'bar' }],
-        'functions can not be merged into'
-    );
+  if (typeof a !== 'object' || typeof b !== 'object') {
+    return a === b;
+  }
 
-    func.bar = 'baz';
-    t.deepEqual(
-        utils.merge({ foo: 'bar' }, func),
-        { foo: 'bar', bar: 'baz' },
-        'functions can be merge sources'
-    );
+  if (a instanceof Date && b instanceof Date) {
+    return a.getTime() === b.getTime();
+  }
 
-    t.test(
-        'avoids invoking array setters unnecessarily',
-        { skip: typeof Object.defineProperty !== 'function' },
-        function (st) {
-            var setCount = 0;
-            var getCount = 0;
-            var observed = [];
-            Object.defineProperty(observed, 0, {
-                get: function () {
-                    getCount += 1;
-                    return { bar: 'baz' };
-                },
-                set: function () { setCount += 1; }
-            });
-            utils.merge(observed, [null]);
-            st.equal(setCount, 0);
-            st.equal(getCount, 1);
-            observed[0] = observed[0]; // eslint-disable-line no-self-assign
-            st.equal(setCount, 1);
-            st.equal(getCount, 2);
+  if ((isBsonType(a, 'ObjectId') && isBsonType(b, 'ObjectId')) ||
+      (isBsonType(a, 'Decimal128') && isBsonType(b, 'Decimal128'))) {
+    return a.toString() === b.toString();
+  }
 
-            st.end();
+  if (a instanceof RegExp && b instanceof RegExp) {
+    return a.source === b.source &&
+        a.ignoreCase === b.ignoreCase &&
+        a.multiline === b.multiline &&
+        a.global === b.global &&
+        a.dotAll === b.dotAll &&
+        a.unicode === b.unicode &&
+        a.sticky === b.sticky &&
+        a.hasIndices === b.hasIndices;
+  }
+
+  if (a == null || b == null) {
+    return false;
+  }
+
+  if (a.prototype !== b.prototype) {
+    return false;
+  }
+
+  if (a instanceof Map || b instanceof Map) {
+    if (!(a instanceof Map) || !(b instanceof Map)) {
+      return false;
+    }
+    return deepEqual(Array.from(a.keys()), Array.from(b.keys())) &&
+      deepEqual(Array.from(a.values()), Array.from(b.values()));
+  }
+
+  // Handle MongooseNumbers
+  if (a instanceof Number && b instanceof Number) {
+    return a.valueOf() === b.valueOf();
+  }
+
+  if (Buffer.isBuffer(a)) {
+    return exports.buffer.areEqual(a, b);
+  }
+
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b)) {
+      return false;
+    }
+    const len = a.length;
+    if (len !== b.length) {
+      return false;
+    }
+    for (let i = 0; i < len; ++i) {
+      if (!deepEqual(a[i], b[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (a.$__ != null) {
+    a = a._doc;
+  } else if (isMongooseObject(a)) {
+    a = a.toObject();
+  }
+
+  if (b.$__ != null) {
+    b = b._doc;
+  } else if (isMongooseObject(b)) {
+    b = b.toObject();
+  }
+
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  const kaLength = ka.length;
+
+  // having the same number of owned properties (keys incorporates
+  // hasOwnProperty)
+  if (kaLength !== kb.length) {
+    return false;
+  }
+
+  // ~~~cheap key test
+  for (let i = kaLength - 1; i >= 0; i--) {
+    if (ka[i] !== kb[i]) {
+      return false;
+    }
+  }
+
+  // equivalent values for every corresponding key, and
+  // ~~~possibly expensive deep test
+  for (const key of ka) {
+    if (!deepEqual(a[key], b[key])) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
+/**
+ * Get the last element of an array
+ * @param {Array} arr
+ */
+
+exports.last = function(arr) {
+  if (arr.length > 0) {
+    return arr[arr.length - 1];
+  }
+  return void 0;
+};
+
+/*!
+ * ignore
+ */
+
+exports.promiseOrCallback = promiseOrCallback;
+
+/*!
+ * ignore
+ */
+
+exports.cloneArrays = function cloneArrays(arr) {
+  if (!Array.isArray(arr)) {
+    return arr;
+  }
+
+  return arr.map(el => exports.cloneArrays(el));
+};
+
+/*!
+ * ignore
+ */
+
+exports.omit = function omit(obj, keys) {
+  if (keys == null) {
+    return Object.assign({}, obj);
+  }
+  if (!Array.isArray(keys)) {
+    keys = [keys];
+  }
+
+  const ret = Object.assign({}, obj);
+  for (const key of keys) {
+    delete ret[key];
+  }
+  return ret;
+};
+
+/**
+ * Simplified version of `clone()` that only clones POJOs and arrays. Skips documents, dates, objectids, etc.
+ * @param {*} val
+ * @returns
+*/
+
+exports.clonePOJOsAndArrays = function clonePOJOsAndArrays(val) {
+  if (val == null) {
+    return val;
+  }
+  // Skip documents because we assume they'll be cloned later. See gh-15312 for how documents are handled with `merge()`.
+  if (val.$__ != null) {
+    return val;
+  }
+  if (isPOJO(val)) {
+    val = { ...val };
+    for (const key of Object.keys(val)) {
+      val[key] = exports.clonePOJOsAndArrays(val[key]);
+    }
+    return val;
+  }
+  if (Array.isArray(val)) {
+    val = [...val];
+    for (let i = 0; i < val.length; ++i) {
+      val[i] = exports.clonePOJOsAndArrays(val[i]);
+    }
+    return val;
+  }
+
+  return val;
+};
+
+/**
+ * Merges `from` into `to` without overwriting existing properties.
+ *
+ * @param {Object} to
+ * @param {Object} from
+ * @param {Object} [options]
+ * @param {String} [path]
+ * @api private
+ */
+
+exports.merge = function merge(to, from, options, path) {
+  options = options || {};
+
+  const keys = Object.keys(from);
+  let i = 0;
+  const len = keys.length;
+  let key;
+
+  if (from[trustedSymbol]) {
+    to[trustedSymbol] = from[trustedSymbol];
+  }
+
+  path = path || '';
+  const omitNested = options.omitNested || {};
+
+  while (i < len) {
+    key = keys[i++];
+    if (options.omit && options.omit[key]) {
+      continue;
+    }
+    if (omitNested[path]) {
+      continue;
+    }
+    if (specialProperties.has(key)) {
+      continue;
+    }
+    if (to[key] == null) {
+      to[key] = exports.clonePOJOsAndArrays(from[key]);
+    } else if (exports.isObject(from[key])) {
+      if (!exports.isObject(to[key])) {
+        to[key] = {};
+      }
+      if (from[key] != null) {
+        // Skip merging schemas if we're creating a discriminator schema and
+        // base schema has a given path as a single nested but discriminator schema
+        // has the path as a document array, or vice versa (gh-9534)
+        if (options.isDiscriminatorSchemaMerge &&
+            (from[key].$isSingleNested && to[key].$isMongooseDocumentArray) ||
+            (from[key].$isMongooseDocumentArray && to[key].$isSingleNested)) {
+          continue;
+        } else if (from[key].instanceOfSchema) {
+          if (to[key].instanceOfSchema) {
+            schemaMerge(to[key], from[key].clone(), options.isDiscriminatorSchemaMerge);
+          } else {
+            to[key] = from[key].clone();
+          }
+          continue;
+        } else if (isBsonType(from[key], 'ObjectId')) {
+          to[key] = new ObjectId(from[key]);
+          continue;
         }
-    );
-
-    t.test('with overflow objects (from arrayLimit)', function (st) {
-        // arrayLimit is max index, so with limit 0, max index 0 is allowed (1 element)
-        // To create overflow, need 2+ elements with limit 0, or 3+ with limit 1, etc.
-        st.test('merges primitive into overflow object at next index', function (s2t) {
-            // Create an overflow object via combine: 3 elements (indices 0-2) with limit 0
-            var overflow = utils.combine(['a', 'b'], 'c', 0, false);
-            s2t.ok(utils.isOverflow(overflow), 'overflow object is marked');
-            var merged = utils.merge(overflow, 'd');
-            s2t.deepEqual(merged, { 0: 'a', 1: 'b', 2: 'c', 3: 'd' }, 'adds primitive at next numeric index');
-
-            s2t.end();
-        });
-
-        st.test('merges primitive into regular object with numeric keys normally', function (s2t) {
-            var obj = { 0: 'a', 1: 'b' };
-            s2t.notOk(utils.isOverflow(obj), 'plain object is not marked as overflow');
-            var merged = utils.merge(obj, 'c');
-            s2t.deepEqual(merged, { 0: 'a', 1: 'b', c: true }, 'adds primitive as key (not at next index)');
-            s2t.end();
-        });
-
-        st.test('merges primitive into object with non-numeric keys normally', function (s2t) {
-            var obj = { foo: 'bar' };
-            var merged = utils.merge(obj, 'baz');
-            s2t.deepEqual(merged, { foo: 'bar', baz: true }, 'adds primitive as key with value true');
-
-            s2t.end();
-        });
-
-        st.test('with strictMerge, wraps object and primitive in array', function (s2t) {
-            var obj = { foo: 'bar' };
-            var merged = utils.merge(obj, 'baz', { strictMerge: true });
-            s2t.deepEqual(merged, [{ foo: 'bar' }, 'baz'], 'wraps in array with strictMerge');
-            s2t.end();
-        });
-
-        st.test('merges overflow object into primitive', function (s2t) {
-            // Create an overflow object via combine: 2 elements (indices 0-1) with limit 0
-            var overflow = utils.combine(['a'], 'b', 0, false);
-            s2t.ok(utils.isOverflow(overflow), 'overflow object is marked');
-            var merged = utils.merge('c', overflow);
-            s2t.ok(utils.isOverflow(merged), 'result is also marked as overflow');
-            s2t.deepEqual(merged, { 0: 'c', 1: 'a', 2: 'b' }, 'creates object with primitive at 0, source values shifted');
-
-            s2t.end();
-        });
-
-        st.test('merges overflow object into primitive with plainObjects', function (s2t) {
-            var overflow = utils.combine(['a'], 'b', 0, false);
-            s2t.ok(utils.isOverflow(overflow), 'overflow object is marked');
-            var merged = utils.merge('c', overflow, { plainObjects: true });
-            s2t.ok(utils.isOverflow(merged), 'result is also marked as overflow');
-            s2t.deepEqual(merged, { __proto__: null, 0: 'c', 1: 'a', 2: 'b' }, 'creates null-proto object with primitive at 0');
-
-            s2t.end();
-        });
-
-        st.test('merges overflow object with multiple values into primitive', function (s2t) {
-            // Create an overflow object via combine: 3 elements (indices 0-2) with limit 0
-            var overflow = utils.combine(['b', 'c'], 'd', 0, false);
-            s2t.ok(utils.isOverflow(overflow), 'overflow object is marked');
-            var merged = utils.merge('a', overflow);
-            s2t.deepEqual(merged, { 0: 'a', 1: 'b', 2: 'c', 3: 'd' }, 'shifts all source indices by 1');
-
-            s2t.end();
-        });
-
-        st.test('merges regular object into primitive as array', function (s2t) {
-            var obj = { foo: 'bar' };
-            var merged = utils.merge('a', obj);
-            s2t.deepEqual(merged, ['a', { foo: 'bar' }], 'creates array with primitive and object');
-
-            s2t.end();
-        });
-
-        st.test('merges primitive into array that exceeds arrayLimit', function (s2t) {
-            var arr = ['a', 'b', 'c'];
-            var merged = utils.merge(arr, 'd', { arrayLimit: 1 });
-            s2t.ok(utils.isOverflow(merged), 'result is marked as overflow');
-            s2t.deepEqual(merged, { 0: 'a', 1: 'b', 2: 'c', 3: 'd' }, 'converts to overflow object with primitive appended');
-
-            s2t.end();
-        });
-
-        st.test('merges array into primitive that exceeds arrayLimit', function (s2t) {
-            var merged = utils.merge('a', ['b', 'c'], { arrayLimit: 1 });
-            s2t.ok(utils.isOverflow(merged), 'result is marked as overflow');
-            s2t.deepEqual(merged, { 0: 'a', 1: 'b', 2: 'c' }, 'converts to overflow object');
-
-            s2t.end();
-        });
-
-        st.test('merges primitive into array at the arrayLimit boundary, consistently with combine', function (s2t) {
-            var merged = utils.merge(['a'], 'b', { arrayLimit: 1 });
-            s2t.ok(utils.isOverflow(merged), 'result is marked as overflow at the boundary');
-            s2t.deepEqual(merged, { 0: 'a', 1: 'b' }, 'converts to overflow object instead of a length-2 array');
-
-            s2t.end();
-        });
-
-        st.test('merges two arrays that exceed arrayLimit into an overflow object', function (s2t) {
-            var merged = utils.merge(['a'], ['b'], { arrayLimit: 1 });
-            s2t.ok(utils.isOverflow(merged), 'result is marked as overflow');
-            s2t.deepEqual(merged, { 0: 'a', 1: 'b' }, 'array-into-array merge enforces arrayLimit like combine');
-
-            s2t.end();
-        });
-
-        st.test('throws at the arrayLimit boundary when merging a primitive into an array with throwOnLimitExceeded', function (s2t) {
-            s2t['throws'](
-                function () { utils.merge(['a'], 'b', { arrayLimit: 1, throwOnLimitExceeded: true }); },
-                new RangeError('Array limit exceeded. Only 1 element allowed in an array.'),
-                'throws when the resulting length would exceed arrayLimit'
-            );
-
-            s2t.end();
-        });
-
-        st.test('throws when merging two arrays past arrayLimit with throwOnLimitExceeded', function (s2t) {
-            s2t['throws'](
-                function () { utils.merge(['a'], ['b'], { arrayLimit: 1, throwOnLimitExceeded: true }); },
-                new RangeError('Array limit exceeded. Only 1 element allowed in an array.'),
-                'array-into-array merge throws rather than silently exceeding arrayLimit'
-            );
-            s2t['throws'](
-                function () { utils.merge(['a', 'b', 'c'], ['d', 'e', 'f'], { arrayLimit: 2, throwOnLimitExceeded: true }); },
-                new RangeError('Array limit exceeded. Only 2 elements allowed in an array.'),
-                'uses the plural message when arrayLimit is not 1'
-            );
-
-            s2t.end();
-        });
-
-        st.test('throws instead of merging primitive into over-limit array when throwOnLimitExceeded is set', function (s2t) {
-            s2t['throws'](
-                function () { utils.merge(['a', 'b', 'c'], 'd', { arrayLimit: 1, throwOnLimitExceeded: true }); },
-                new RangeError('Array limit exceeded. Only 1 element allowed in an array.'),
-                'throws rather than converting to an overflow object'
-            );
-            s2t['throws'](
-                function () { utils.merge(['a', 'b', 'c'], 'd', { arrayLimit: 2, throwOnLimitExceeded: true }); },
-                new RangeError('Array limit exceeded. Only 2 elements allowed in an array.'),
-                'uses the plural message when arrayLimit is not 1'
-            );
-
-            s2t.end();
-        });
-
-        st.test('throws instead of merging array into primitive when throwOnLimitExceeded is set', function (s2t) {
-            s2t['throws'](
-                function () { utils.merge('a', ['b', 'c'], { arrayLimit: 1, throwOnLimitExceeded: true }); },
-                new RangeError('Array limit exceeded. Only 1 element allowed in an array.'),
-                'throws rather than converting to an overflow object'
-            );
-            s2t['throws'](
-                function () { utils.merge('a', ['b', 'c', 'd'], { arrayLimit: 2, throwOnLimitExceeded: true }); },
-                new RangeError('Array limit exceeded. Only 2 elements allowed in an array.'),
-                'uses the plural message when arrayLimit is not 1'
-            );
-
-            s2t.end();
-        });
-
-        st.end();
-    });
-
-    t.end();
-});
-
-test('assign()', function (t) {
-    var target = { a: 1, b: 2 };
-    var source = { b: 3, c: 4 };
-    var result = utils.assign(target, source);
-
-    t.equal(result, target, 'returns the target');
-    t.deepEqual(target, { a: 1, b: 3, c: 4 }, 'target and source are merged');
-    t.deepEqual(source, { b: 3, c: 4 }, 'source is untouched');
-
-    t.end();
-});
-
-test('combine()', function (t) {
-    t.test('both arrays', function (st) {
-        var a = [1];
-        var b = [2];
-        var combined = utils.combine(a, b);
-
-        st.deepEqual(a, [1], 'a is not mutated');
-        st.deepEqual(b, [2], 'b is not mutated');
-        st.notEqual(a, combined, 'a !== combined');
-        st.notEqual(b, combined, 'b !== combined');
-        st.deepEqual(combined, [1, 2], 'combined is a + b');
-
-        st.end();
-    });
-
-    t.test('one array, one non-array', function (st) {
-        var aN = 1;
-        var a = [aN];
-        var bN = 2;
-        var b = [bN];
-
-        var combinedAnB = utils.combine(aN, b);
-        st.deepEqual(b, [bN], 'b is not mutated');
-        st.notEqual(aN, combinedAnB, 'aN + b !== aN');
-        st.notEqual(a, combinedAnB, 'aN + b !== a');
-        st.notEqual(bN, combinedAnB, 'aN + b !== bN');
-        st.notEqual(b, combinedAnB, 'aN + b !== b');
-        st.deepEqual([1, 2], combinedAnB, 'first argument is array-wrapped when not an array');
-
-        var combinedABn = utils.combine(a, bN);
-        st.deepEqual(a, [aN], 'a is not mutated');
-        st.notEqual(aN, combinedABn, 'a + bN !== aN');
-        st.notEqual(a, combinedABn, 'a + bN !== a');
-        st.notEqual(bN, combinedABn, 'a + bN !== bN');
-        st.notEqual(b, combinedABn, 'a + bN !== b');
-        st.deepEqual([1, 2], combinedABn, 'second argument is array-wrapped when not an array');
-
-        st.end();
-    });
-
-    t.test('neither is an array', function (st) {
-        var combined = utils.combine(1, 2);
-        st.notEqual(1, combined, '1 + 2 !== 1');
-        st.notEqual(2, combined, '1 + 2 !== 2');
-        st.deepEqual([1, 2], combined, 'both arguments are array-wrapped when not an array');
-
-        st.end();
-    });
-
-    t.test('with arrayLimit', function (st) {
-        st.test('under the limit', function (s2t) {
-            var combined = utils.combine(['a', 'b'], 'c', 10, false);
-            s2t.deepEqual(combined, ['a', 'b', 'c'], 'returns array when under limit');
-            s2t.ok(Array.isArray(combined), 'result is an array');
-            s2t.end();
-        });
-
-        st.test('exactly at the limit stays as array', function (s2t) {
-            var combined = utils.combine(['a', 'b'], 'c', 3, false);
-            s2t.deepEqual(combined, ['a', 'b', 'c'], 'stays as array when count equals limit');
-            s2t.ok(Array.isArray(combined), 'result is an array');
-            s2t.end();
-        });
-
-        st.test('over the limit', function (s2t) {
-            var combined = utils.combine(['a', 'b', 'c'], 'd', 3, false);
-            s2t.deepEqual(combined, { 0: 'a', 1: 'b', 2: 'c', 3: 'd' }, 'converts to object when over limit');
-            s2t.notOk(Array.isArray(combined), 'result is not an array');
-            s2t.end();
-        });
-
-        st.test('with arrayLimit 1', function (s2t) {
-            var combined = utils.combine([], 'a', 1, false);
-            s2t.deepEqual(combined, ['a'], 'stays as array when count equals limit');
-            s2t.ok(Array.isArray(combined), 'result is an array');
-            s2t.end();
-        });
-
-        st.test('with arrayLimit 0 converts single element to object', function (s2t) {
-            var combined = utils.combine([], 'a', 0, false);
-            s2t.deepEqual(combined, { 0: 'a' }, 'converts to object when count exceeds limit');
-            s2t.notOk(Array.isArray(combined), 'result is not an array');
-            s2t.end();
-        });
-
-        st.test('with arrayLimit 0 and two elements converts to object', function (s2t) {
-            var combined = utils.combine(['a'], 'b', 0, false);
-            s2t.deepEqual(combined, { 0: 'a', 1: 'b' }, 'converts to object when count exceeds limit');
-            s2t.notOk(Array.isArray(combined), 'result is not an array');
-            s2t.end();
-        });
-
-        st.test('with plainObjects option', function (s2t) {
-            var combined = utils.combine(['a', 'b'], 'c', 1, true);
-            var expected = { __proto__: null, 0: 'a', 1: 'b', 2: 'c' };
-            s2t.deepEqual(combined, expected, 'converts to object with null prototype');
-            s2t.equal(Object.getPrototypeOf(combined), null, 'result has null prototype when plainObjects is true');
-            s2t.end();
-        });
-
-        st.end();
-    });
-
-    t.test('with throwOnLimitExceeded', function (st) {
-        st.test('throws when concatenation exceeds the limit', function (s2t) {
-            s2t['throws'](
-                function () { utils.combine(['a', 'b', 'c'], 'd', 3, false, true); },
-                new RangeError('Array limit exceeded. Only 3 elements allowed in an array.'),
-                'throws instead of converting to an overflow object'
-            );
-            s2t['throws'](
-                function () { utils.combine([], 'a', 0, false, true); },
-                new RangeError('Array limit exceeded. Only 0 elements allowed in an array.'),
-                'throws with the correct count at arrayLimit 0'
-            );
-            s2t.end();
-        });
-
-        st.test('throws when adding to an existing overflow object', function (s2t) {
-            var overflow = utils.combine(['a', 'b'], 'c', 0, false);
-            s2t.ok(utils.isOverflow(overflow), 'initial object is marked as overflow');
-
-            s2t['throws'](
-                function () { utils.combine(overflow, 'd', 0, false, true); },
-                new RangeError('Array limit exceeded. Only 0 elements allowed in an array.'),
-                'throws rather than appending to the overflow object'
-            );
-            s2t['throws'](
-                function () { utils.combine(overflow, 'd', 1, false, true); },
-                new RangeError('Array limit exceeded. Only 1 element allowed in an array.'),
-                'uses the singular message at arrayLimit 1'
-            );
-            s2t.end();
-        });
-
-        st.test('does not throw when within the limit', function (s2t) {
-            var combined = utils.combine(['a'], 'b', 5, false, true);
-            s2t.deepEqual(combined, ['a', 'b'], 'returns the array unchanged when under the limit');
-            s2t.end();
-        });
-
-        st.end();
-    });
-
-    t.test('with existing overflow object', function (st) {
-        st.test('adds to existing overflow object at next index', function (s2t) {
-            // Create overflow object first via combine: 3 elements (indices 0-2) with limit 0
-            var overflow = utils.combine(['a', 'b'], 'c', 0, false);
-            s2t.ok(utils.isOverflow(overflow), 'initial object is marked as overflow');
-
-            var combined = utils.combine(overflow, 'd', 10, false);
-            s2t.equal(combined, overflow, 'returns the same object (mutated)');
-            s2t.deepEqual(combined, { 0: 'a', 1: 'b', 2: 'c', 3: 'd' }, 'adds value at next numeric index');
-            s2t.end();
-        });
-
-        st.test('does not treat plain object with numeric keys as overflow', function (s2t) {
-            var plainObj = { 0: 'a', 1: 'b' };
-            s2t.notOk(utils.isOverflow(plainObj), 'plain object is not marked as overflow');
-
-            // combine treats this as a regular value, not an overflow object to append to
-            var combined = utils.combine(plainObj, 'c', 10, false);
-            s2t.deepEqual(combined, [{ 0: 'a', 1: 'b' }, 'c'], 'concatenates as regular values');
-            s2t.end();
-        });
-
-        st.end();
-    });
-
-    t.end();
-});
-
-test('decode', function (t) {
-    t.equal(
-        utils.decode('a+b'),
-        'a b',
-        'decodes + to space'
-    );
-
-    t.equal(
-        utils.decode('name%2Eobj'),
-        'name.obj',
-        'decodes a string'
-    );
-    t.equal(
-        utils.decode('name%2Eobj%2Efoo', null, 'iso-8859-1'),
-        'name.obj.foo',
-        'decodes a string in iso-8859-1'
-    );
-
-    t.end();
-});
-
-test('encode', function (t) {
-    forEach(v.nullPrimitives, function (nullish) {
-        t['throws'](
-            function () { utils.encode(nullish); },
-            TypeError,
-            inspect(nullish) + ' is not a string'
-        );
-    });
-
-    t.equal(utils.encode(''), '', 'empty string returns itself');
-    t.deepEqual(utils.encode([]), [], 'empty array returns itself');
-    t.deepEqual(utils.encode({ length: 0 }), { length: 0 }, 'empty arraylike returns itself');
-
-    t.test('symbols', { skip: !v.hasSymbols }, function (st) {
-        st.equal(utils.encode(Symbol('x')), 'Symbol%28x%29', 'symbol is encoded');
-
-        st.end();
-    });
-
-    t.equal(
-        utils.encode('(abc)'),
-        '%28abc%29',
-        'encodes parentheses'
-    );
-    t.equal(
-        utils.encode({ toString: function () { return '(abc)'; } }),
-        '%28abc%29',
-        'toStrings and encodes parentheses'
-    );
-
-    t.equal(
-        utils.encode('abc 123 💩', null, 'iso-8859-1'),
-        'abc%20123%20%26%2355357%3B%26%2356489%3B',
-        'encodes in iso-8859-1'
-    );
-
-    var longString = '';
-    var expectedString = '';
-    for (var i = 0; i < 1500; i++) {
-        longString += ' ';
-        expectedString += '%20';
+      }
+      merge(to[key], from[key], options, path ? path + '.' + key : key);
+    } else if (options.overwrite) {
+      to[key] = from[key];
+    }
+  }
+
+  return to;
+};
+
+/**
+ * Applies toObject recursively.
+ *
+ * @param {Document|Array|Object} obj
+ * @return {Object}
+ * @api private
+ */
+
+exports.toObject = function toObject(obj) {
+  Document || (Document = require('./document'));
+  let ret;
+
+  if (obj == null) {
+    return obj;
+  }
+
+  if (obj instanceof Document) {
+    return obj.toObject();
+  }
+
+  if (Array.isArray(obj)) {
+    ret = [];
+
+    for (const doc of obj) {
+      ret.push(toObject(doc));
     }
 
-    t.equal(
-        utils.encode(longString),
-        expectedString,
-        'encodes a long string'
-    );
+    return ret;
+  }
 
-    var boundary = '';
-    var expected = '';
-    for (var j = 0; j < 1023; j++) {
-        boundary += 'a';
-        expected += 'a';
+  if (exports.isPOJO(obj)) {
+    ret = {};
+
+    if (obj[trustedSymbol]) {
+      ret[trustedSymbol] = obj[trustedSymbol];
     }
-    boundary += '😀';
-    expected += '%F0%9F%98%80';
 
-    t.equal(
-        utils.encode(boundary),
-        expected,
-        'encodes a surrogate pair split across long-string chunks'
-    );
-
-    var laterBoundary = '';
-    var laterExpected = '';
-    for (var k = 0; k < 2047; k++) {
-        laterBoundary += 'a';
-        laterExpected += 'a';
+    for (const k of Object.keys(obj)) {
+      if (specialProperties.has(k)) {
+        continue;
+      }
+      ret[k] = toObject(obj[k]);
     }
-    laterBoundary += '😀';
-    laterExpected += '%F0%9F%98%80';
 
-    t.equal(
-        utils.encode(laterBoundary),
-        laterExpected,
-        'encodes a surrogate pair split across a later chunk boundary'
-    );
+    return ret;
+  }
 
-    var twoPairs = '';
-    for (k = 0; k < 1023; k++) {
-        twoPairs += 'a';
+  return obj;
+};
+
+exports.isObject = isObject;
+
+/**
+ * Determines if `arg` is a plain old JavaScript object (POJO). Specifically,
+ * `arg` must be an object but not an instance of any special class, like String,
+ * ObjectId, etc.
+ *
+ * `Object.getPrototypeOf()` is part of ES5: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/getPrototypeOf
+ *
+ * @param {Object|Array|String|Function|RegExp|any} arg
+ * @api private
+ * @return {Boolean}
+ */
+
+exports.isPOJO = require('./helpers/isPOJO');
+
+/**
+ * Determines if `arg` is an object that isn't an instance of a built-in value
+ * class, like Array, Buffer, ObjectId, etc.
+ * @param {Any} val
+ */
+
+exports.isNonBuiltinObject = function isNonBuiltinObject(val) {
+  return typeof val === 'object' &&
+    !exports.isNativeObject(val) &&
+    !exports.isMongooseType(val) &&
+    !(val instanceof UUID) &&
+    val != null;
+};
+
+/**
+ * Determines if `obj` is a built-in object like an array, date, boolean,
+ * etc.
+ * @param {Any} arg
+ */
+
+exports.isNativeObject = function(arg) {
+  return Array.isArray(arg) ||
+    arg instanceof Date ||
+    arg instanceof Boolean ||
+    arg instanceof Number ||
+    arg instanceof String;
+};
+
+/**
+ * Determines if `val` is an object that has no own keys
+ * @param {Any} val
+ */
+
+exports.isEmptyObject = function(val) {
+  return val != null &&
+    typeof val === 'object' &&
+    Object.keys(val).length === 0;
+};
+
+/**
+ * Search if `obj` or any POJOs nested underneath `obj` has a property named
+ * `key`
+ * @param {Object} obj
+ * @param {String} key
+ */
+
+exports.hasKey = function hasKey(obj, key) {
+  const props = Object.keys(obj);
+  for (const prop of props) {
+    if (prop === key) {
+      return true;
     }
-    twoPairs += '😀';
-    for (k = 0; k < 1022; k++) {
-        twoPairs += 'b';
+    if (exports.isPOJO(obj[prop]) && exports.hasKey(obj[prop], key)) {
+      return true;
     }
-    twoPairs += '😀';
+  }
+  return false;
+};
 
-    t.equal(
-        (utils.encode(twoPairs).match(/%F0%9F%98%80/g) || []).length,
-        2,
-        'encodes two surrogate pairs each split across a chunk boundary'
-    );
+/**
+ * process.nextTick helper.
+ *
+ * Wraps `callback` in a try/catch + nextTick.
+ *
+ * node-mongodb-native has a habit of state corruption when an error is immediately thrown from within a collection callback.
+ *
+ * @param {Function} callback
+ * @api private
+ */
 
-    var roundTrip = '';
-    for (k = 0; k < 1023; k++) {
-        roundTrip += 'a';
+exports.tick = function tick(callback) {
+  if (typeof callback !== 'function') {
+    return;
+  }
+  return function() {
+    try {
+      callback.apply(this, arguments);
+    } catch (err) {
+      // only nextTick on err to get out of
+      // the event loop and avoid state corruption.
+      immediate(function() {
+        throw err;
+      });
     }
-    roundTrip += '😀';
+  };
+};
 
-    t.equal(
-        decodeURIComponent(utils.encode(roundTrip)),
-        roundTrip,
-        'a boundary-split surrogate pair round-trips through decodeURIComponent'
-    );
+/**
+ * Returns true if `v` is an object that can be serialized as a primitive in
+ * MongoDB
+ * @param {Any} v
+ */
 
-    var loneBoundary = '';
-    var loneExpected = '';
-    for (k = 0; k < 1023; k++) {
-        loneBoundary += 'a';
-        loneExpected += 'a';
+exports.isMongooseType = function(v) {
+  return isBsonType(v, 'ObjectId') || isBsonType(v, 'Decimal128') || v instanceof Buffer;
+};
+
+exports.isMongooseObject = isMongooseObject;
+
+/**
+ * Converts `expires` options of index objects to `expiresAfterSeconds` options for MongoDB.
+ *
+ * @param {Object} object
+ * @api private
+ */
+
+exports.expires = function expires(object) {
+  if (!(object && object.constructor.name === 'Object')) {
+    return;
+  }
+  if (!('expires' in object)) {
+    return;
+  }
+
+  object.expireAfterSeconds = (typeof object.expires !== 'string')
+    ? object.expires
+    : Math.round(ms(object.expires) / 1000);
+  delete object.expires;
+};
+
+/**
+ * populate helper
+ * @param {String} path
+ * @param {String} select
+ * @param {Model} model
+ * @param {Object} match
+ * @param {Object} options
+ * @param {Any} subPopulate
+ * @param {Boolean} justOne
+ * @param {Boolean} count
+ */
+
+exports.populate = function populate(path, select, model, match, options, subPopulate, justOne, count) {
+  // might have passed an object specifying all arguments
+  let obj = null;
+  if (arguments.length === 1) {
+    if (path instanceof PopulateOptions) {
+      // If reusing old populate docs, avoid reusing `_docs` because that may
+      // lead to bugs and memory leaks. See gh-11641
+      path._docs = {};
+      path._childDocs = [];
+      return [path];
     }
-    loneBoundary += '\uD83DX';
-    loneExpected += '%F0%9F%91%98';
 
-    t.equal(
-        utils.encode(loneBoundary),
-        loneExpected,
-        'a lone high surrogate at a chunk boundary encodes the same as mid-chunk'
-    );
+    if (Array.isArray(path)) {
+      const singles = makeSingles(path);
+      return singles.map(o => exports.populate(o)[0]);
+    }
 
-    t.equal(
-        utils.encode('\x28\x29'),
-        '%28%29',
-        'encodes parens normally'
-    );
-    t.equal(
-        utils.encode('\x28\x29', null, null, null, 'RFC1738'),
-        '()',
-        'does not encode parens in RFC1738'
-    );
+    if (exports.isObject(path)) {
+      obj = Object.assign({}, path);
+    } else {
+      obj = { path: path };
+    }
+  } else if (typeof model === 'object') {
+    obj = {
+      path: path,
+      select: select,
+      match: model,
+      options: match
+    };
+  } else {
+    obj = {
+      path: path,
+      select: select,
+      model: model,
+      match: match,
+      options: options,
+      populate: subPopulate,
+      justOne: justOne,
+      count: count
+    };
+  }
 
-    // todo RFC1738 format
+  if (typeof obj.path !== 'string' && !(Array.isArray(obj.path) && obj.path.every(el => typeof el === 'string'))) {
+    throw new TypeError('utils.populate: invalid path. Expected string or array of strings. Got typeof `' + typeof path + '`');
+  }
 
-    t.equal(
-        utils.encode('Āက豈'),
-        '%C4%80%E1%80%80%EF%A4%80',
-        'encodes multibyte chars'
-    );
+  return _populateObj(obj);
 
-    t.equal(
-        utils.encode('\uD83D \uDCA9'),
-        '%F0%9F%90%A0%F0%BA%90%80',
-        'encodes lone surrogates'
-    );
-
-    t.end();
-});
-
-test('isBuffer()', function (t) {
-    var fn = function () {};
-    fn();
-    forEach([null, undefined, true, false, '', 'abc', 42, 0, NaN, {}, [], fn, /a/g], function (x) {
-        t.equal(utils.isBuffer(x), false, inspect(x) + ' is not a buffer');
+  // The order of select/conditions args is opposite Model.find but
+  // necessary to keep backward compatibility (select could be
+  // an array, string, or object literal).
+  function makeSingles(arr) {
+    const ret = [];
+    arr.forEach(function(obj) {
+      if (oneSpaceRE.test(obj.path)) {
+        const paths = obj.path.split(manySpaceRE);
+        paths.forEach(function(p) {
+          const copy = Object.assign({}, obj);
+          copy.path = p;
+          ret.push(copy);
+        });
+      } else {
+        ret.push(obj);
+      }
     });
 
-    var fakeBuffer = { constructor: Buffer };
-    t.equal(utils.isBuffer(fakeBuffer), false, 'fake buffer is not a buffer');
+    return ret;
+  }
+};
 
-    forEach(['x', 1, true, {}, [], { isBuffer: true }], function (notCallable) {
-        var obj = { constructor: { isBuffer: notCallable } };
-        t.doesNotThrow(function () { utils.isBuffer(obj); }, 'non-callable `constructor.isBuffer` (' + inspect(notCallable) + ') does not throw');
-        t.equal(utils.isBuffer(obj), false, 'non-callable `constructor.isBuffer` (' + inspect(notCallable) + ') is not a buffer');
+function _populateObj(obj) {
+  if (Array.isArray(obj.populate)) {
+    const ret = [];
+    obj.populate.forEach(function(obj) {
+      if (oneSpaceRE.test(obj.path)) {
+        const copy = Object.assign({}, obj);
+        const paths = copy.path.split(manySpaceRE);
+        paths.forEach(function(p) {
+          copy.path = p;
+          ret.push(exports.populate(copy)[0]);
+        });
+      } else {
+        ret.push(exports.populate(obj)[0]);
+      }
     });
+    obj.populate = exports.populate(ret);
+  } else if (obj.populate != null && typeof obj.populate === 'object') {
+    obj.populate = exports.populate(obj.populate);
+  }
 
-    var nullObject = { __proto__: null, constructor: { __proto__: null, isBuffer: 'y' } };
-    t.equal(utils.isBuffer(nullObject), false, 'null object with non-callable `constructor.isBuffer` is not a buffer');
+  const ret = [];
+  const paths = oneSpaceRE.test(obj.path)
+    ? obj.path.split(manySpaceRE)
+    : Array.isArray(obj.path)
+      ? obj.path
+      : [obj.path];
+  if (obj.options != null) {
+    obj.options = clone(obj.options);
+  }
 
-    var duckBuffer = { constructor: { isBuffer: function () { return true; } } };
-    t.equal(utils.isBuffer(duckBuffer), true, 'callable `constructor.isBuffer` is still honored');
+  for (const path of paths) {
+    ret.push(new PopulateOptions(Object.assign({}, obj, { path: path })));
+  }
 
-    var saferBuffer = SaferBuffer.from('abc');
-    t.equal(utils.isBuffer(saferBuffer), true, 'SaferBuffer instance is a buffer');
+  return ret;
+}
 
-    var buffer = SaferBuffer.from('abc');
-    t.notEqual(saferBuffer, buffer, 'different buffer instances');
-    t.equal(utils.isBuffer(buffer), true, 'another Buffer instance is a buffer');
-    t.end();
-});
+/**
+ * Return the value of `obj` at the given `path`.
+ *
+ * @param {String} path
+ * @param {Object} obj
+ * @param {Any} map
+ */
 
-test('isRegExp()', function (t) {
-    t.equal(utils.isRegExp(/a/g), true, 'RegExp is a RegExp');
-    t.equal(utils.isRegExp(new RegExp('a', 'g')), true, 'new RegExp is a RegExp');
-    t.equal(utils.isRegExp(new Date()), false, 'Date is not a RegExp');
+exports.getValue = function(path, obj, map) {
+  return mpath.get(path, obj, getValueLookup, map);
+};
 
-    forEach(v.primitives, function (primitive) {
-        t.equal(utils.isRegExp(primitive), false, inspect(primitive) + ' is not a RegExp');
+/*!
+ * ignore
+ */
+
+const mapGetterOptions = Object.freeze({ getters: false });
+
+function getValueLookup(obj, part) {
+  if (part === '$*' && obj instanceof Map) {
+    return obj;
+  }
+  let _from = obj?._doc || obj;
+  if (_from != null && _from.isMongooseArrayProxy) {
+    _from = _from.__array;
+  }
+  return _from instanceof Map ?
+    _from.get(part, mapGetterOptions) :
+    _from[part];
+}
+
+/**
+ * Sets the value of `obj` at the given `path`.
+ *
+ * @param {String} path
+ * @param {Anything} val
+ * @param {Object} obj
+ * @param {Any} map
+ * @param {Any} _copying
+ */
+
+exports.setValue = function(path, val, obj, map, _copying) {
+  mpath.set(path, val, obj, '_doc', map, _copying);
+};
+
+/**
+ * Returns an array of values from object `o`.
+ *
+ * @param {Object} o
+ * @return {Array}
+ * @api private
+ */
+
+exports.object = {};
+exports.object.vals = function vals(o) {
+  const keys = Object.keys(o);
+  let i = keys.length;
+  const ret = [];
+
+  while (i--) {
+    ret.push(o[keys[i]]);
+  }
+
+  return ret;
+};
+
+
+/**
+ * Determine if `val` is null or undefined
+ *
+ * @param {Any} val
+ * @return {Boolean}
+ */
+
+exports.isNullOrUndefined = function(val) {
+  return val === null || val === undefined;
+};
+
+/*!
+ * ignore
+ */
+
+exports.array = {};
+
+/**
+ * Flattens an array.
+ *
+ * [ 1, [ 2, 3, [4] ]] -> [1,2,3,4]
+ *
+ * @param {Array} arr
+ * @param {Function} [filter] If passed, will be invoked with each item in the array. If `filter` returns a falsy value, the item will not be included in the results.
+ * @param {Array} ret
+ * @return {Array}
+ * @api private
+ */
+
+exports.array.flatten = function flatten(arr, filter, ret) {
+  ret || (ret = []);
+
+  arr.forEach(function(item) {
+    if (Array.isArray(item)) {
+      flatten(item, filter, ret);
+    } else {
+      if (!filter || filter(item)) {
+        ret.push(item);
+      }
+    }
+  });
+
+  return ret;
+};
+
+/*!
+ * ignore
+ */
+
+exports.hasUserDefinedProperty = function(obj, key) {
+  if (obj == null) {
+    return false;
+  }
+
+  if (Array.isArray(key)) {
+    for (const k of key) {
+      if (exports.hasUserDefinedProperty(obj, k)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (Object.hasOwn(obj, key)) {
+    return true;
+  }
+  if (typeof obj === 'object' && key in obj) {
+    const v = obj[key];
+    return v !== Object.prototype[key] && v !== Array.prototype[key];
+  }
+
+  return false;
+};
+
+/*!
+ * ignore
+ */
+
+const MAX_ARRAY_INDEX = Math.pow(2, 32) - 1;
+
+exports.isArrayIndex = function(val) {
+  if (typeof val === 'number') {
+    return val >= 0 && val <= MAX_ARRAY_INDEX;
+  }
+  if (typeof val === 'string') {
+    if (!/^\d+$/.test(val)) {
+      return false;
+    }
+    val = +val;
+    return val >= 0 && val <= MAX_ARRAY_INDEX;
+  }
+
+  return false;
+};
+
+/**
+ * Removes duplicate values from an array
+ *
+ * [1, 2, 3, 3, 5] => [1, 2, 3, 5]
+ * [ ObjectId("550988ba0c19d57f697dc45e"), ObjectId("550988ba0c19d57f697dc45e") ]
+ *    => [ObjectId("550988ba0c19d57f697dc45e")]
+ *
+ * @param {Array} arr
+ * @return {Array}
+ * @api private
+ */
+
+exports.array.unique = function(arr) {
+  const primitives = new Set();
+  const ids = new Set();
+  const ret = [];
+
+  for (const item of arr) {
+    if (typeof item === 'number' || typeof item === 'string' || item == null) {
+      if (primitives.has(item)) {
+        continue;
+      }
+      ret.push(item);
+      primitives.add(item);
+    } else if (isBsonType(item, 'ObjectId')) {
+      if (ids.has(item.toString())) {
+        continue;
+      }
+      ret.push(item);
+      ids.add(item.toString());
+    } else {
+      ret.push(item);
+    }
+  }
+
+  return ret;
+};
+
+exports.buffer = {};
+
+/**
+ * Determines if two buffers are equal.
+ *
+ * @param {Buffer} a
+ * @param {Object} b
+ */
+
+exports.buffer.areEqual = function(a, b) {
+  if (!Buffer.isBuffer(a)) {
+    return false;
+  }
+  if (!Buffer.isBuffer(b)) {
+    return false;
+  }
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0, len = a.length; i < len; ++i) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+};
+
+exports.getFunctionName = getFunctionName;
+
+/**
+ * Decorate buffers
+ * @param {Object} destination
+ * @param {Object} source
+ */
+
+exports.decorate = function(destination, source) {
+  for (const key in source) {
+    if (specialProperties.has(key)) {
+      continue;
+    }
+    destination[key] = source[key];
+  }
+};
+
+/**
+ * merges to with a copy of from
+ *
+ * @param {Object} to
+ * @param {Object} fromObj
+ * @api private
+ */
+
+exports.mergeClone = function(to, fromObj) {
+  if (isMongooseObject(fromObj)) {
+    fromObj = fromObj.toObject({
+      transform: false,
+      virtuals: false,
+      depopulate: true,
+      getters: false,
+      flattenDecimals: false
     });
+  }
+  const keys = Object.keys(fromObj);
+  const len = keys.length;
+  let i = 0;
+  let key;
 
-    t.end();
-});
+  while (i < len) {
+    key = keys[i++];
+    if (specialProperties.has(key)) {
+      continue;
+    }
+    if (typeof to[key] === 'undefined') {
+      to[key] = clone(fromObj[key], {
+        transform: false,
+        virtuals: false,
+        depopulate: true,
+        getters: false,
+        flattenDecimals: false
+      });
+    } else {
+      let val = fromObj[key];
+      if (val != null && val.valueOf && !(val instanceof Date)) {
+        val = val.valueOf();
+      }
+      if (exports.isObject(val)) {
+        let obj = val;
+        if (isMongooseObject(val) && !val.isMongooseBuffer) {
+          obj = obj.toObject({
+            transform: false,
+            virtuals: false,
+            depopulate: true,
+            getters: false,
+            flattenDecimals: false
+          });
+        }
+        if (val.isMongooseBuffer) {
+          obj = Buffer.from(obj);
+        }
+        exports.mergeClone(to[key], obj);
+      } else {
+        to[key] = clone(val, {
+          flattenDecimals: false
+        });
+      }
+    }
+  }
+};
+
+/**
+ * Executes a function on each element of an array (like _.each)
+ *
+ * @param {Array} arr
+ * @param {Function} fn
+ * @api private
+ */
+
+exports.each = function(arr, fn) {
+  for (const item of arr) {
+    fn(item);
+  }
+};
+
+/**
+ * Rename an object key, while preserving its position in the object
+ *
+ * @param {Object} oldObj
+ * @param {String|Number} oldKey
+ * @param {String|Number} newKey
+ * @api private
+ */
+exports.renameObjKey = function(oldObj, oldKey, newKey) {
+  const keys = Object.keys(oldObj);
+  return keys.reduce(
+    (acc, val) => {
+      if (val === oldKey) {
+        acc[newKey] = oldObj[oldKey];
+      } else {
+        acc[val] = oldObj[val];
+      }
+      return acc;
+    },
+    {}
+  );
+};
+
+/*!
+ * ignore
+ */
+
+exports.getOption = function(name) {
+  const sources = Array.prototype.slice.call(arguments, 1);
+
+  for (const source of sources) {
+    if (source == null) {
+      continue;
+    }
+    if (source[name] != null) {
+      return source[name];
+    }
+  }
+
+  return null;
+};
+
+/*!
+ * ignore
+ */
+
+exports.noop = function() {};
+
+exports.errorToPOJO = function errorToPOJO(error) {
+  const isError = error instanceof Error;
+  if (!isError) {
+    throw new Error('`error` must be `instanceof Error`.');
+  }
+
+  const ret = {};
+  for (const properyName of Object.getOwnPropertyNames(error)) {
+    ret[properyName] = error[properyName];
+  }
+  return ret;
+};
+
+/*!
+ * ignore
+ */
+
+exports.warn = function warn(message) {
+  return process.emitWarning(message, { code: 'MONGOOSE' });
+};
+
+
+exports.injectTimestampsOption = function injectTimestampsOption(writeOperation, timestampsOption) {
+  if (timestampsOption == null) {
+    return;
+  }
+  writeOperation.timestamps = timestampsOption;
+};
